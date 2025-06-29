@@ -91,6 +91,12 @@ Merge multiple CBZ files into a single file:
 cbz2epub -merge -output merged.cbz chapter1.cbz chapter2.cbz chapter3.cbz
 ```
 
+or just all files in the dir:
+
+```bash
+cbz2epub -merge -output merged.cbz chapter*.cbz
+```
+
 If no output file is specified, the default name "merged.cbz" will be used:
 
 ```bash
