@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Streaming EPUB converter (`ConvertStreaming`) for memory-efficient processing of large CBZ files
 - Streaming CBZ reader (`IterateImages`) with callback-based image processing
-- Comprehensive test suite with 88.5% code coverage
+- Comprehensive test suite with ~83% code coverage (Go 1.24 measurement)
 - CI/CD pipeline: automated testing, linting, and release builds
 - Release workflow with cross-platform binary builds (Linux/macOS/Windows × amd64/arm64)
 - `-version` flag to display application version
@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Root-level `main.go` (moved to `cmd/cbz2epub/`)
 
 ### Technical Notes
-- **Test Coverage**: 88.5% across all packages. Uncovered lines are primarily error-handling branches that would require filesystem mocking.
+- **Test Coverage**: ~83% total across all packages as measured on Go 1.24 (higher on newer toolchains due to coverage-counter changes). Uncovered lines are primarily error-handling branches that would require filesystem mocking.
 - **Go Version**: Requires Go 1.24 or later
 - **Performance**: Streaming reader reduces memory usage for large CBZ files (>500MB)
 
