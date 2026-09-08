@@ -23,56 +23,80 @@ type Image struct {
 	MimeType string
 }
 
-// ReadFile reads a CBZ file and returns its contents
-func ReadFile(filename string) (*File, error) {
+// ImageHandler is a callback that processes one image streamed from a CBZ
+// archive. It receives the base name, an io.Reader positioned at the image
+// bytes, and the MIME type. The handler must consume the reader before it
+// returns; returning an error stops iteration and propagates the error.
+type ImageHandler func(name string, data io.Reader, mimeType string) error
+
+// IterateImages opens a CBZ file and invokes handler for each image in sorted
+// order without buffering the whole archive in memory. Prefer this over
+// ReadFile when the caller only needs to stream images through to an output.
+func IterateImages(filename string, handler ImageHandler) error {
 	zipReader, err := zip.OpenReader(filename)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open CBZ file: %w", err)
+		return fmt.Errorf("failed to open CBZ file: %w", err)
 	}
 	defer zipReader.Close()
 
+	// Collect image entries, skipping directories and non-images.
+	var imageFiles []*zip.File
+	for _, file := range zipReader.File {
+		if !file.FileInfo().IsDir() && IsImageFile(file.Name) {
+			imageFiles = append(imageFiles, file)
+		}
+	}
+
+	// Process images in sorted order by base name.
+	sort.Slice(imageFiles, func(i, j int) bool {
+		return filepath.Base(imageFiles[i].Name) < filepath.Base(imageFiles[j].Name)
+	})
+
+	for _, file := range imageFiles {
+		rc, err := file.Open()
+		if err != nil {
+			return fmt.Errorf("failed to open file in CBZ: %w", err)
+		}
+
+		err = handler(filepath.Base(file.Name), rc, MimeType(file.Name))
+		rc.Close()
+		if err != nil {
+			return fmt.Errorf("error processing image %s: %w", file.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// ReadFile reads a CBZ file and returns its contents. It loads the entire
+// archive into memory; prefer IterateImages for streaming large files.
+func ReadFile(filename string) (*File, error) {
 	cbzFile := &File{
 		Name:   filename,
 		Images: []Image{},
 	}
 
-	// Read all image files from the zip
-	for _, file := range zipReader.File {
-		// Skip directories and non-image files
-		if file.FileInfo().IsDir() || !isImageFile(file.Name) {
-			continue
-		}
-
-		// Open the file inside the zip
-		rc, err := file.Open()
+	err := IterateImages(filename, func(name string, data io.Reader, mimeType string) error {
+		content, err := io.ReadAll(data)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open file in CBZ: %w", err)
+			return fmt.Errorf("failed to read file data: %w", err)
 		}
-
-		// Read the file data
-		data, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read file data: %w", err)
-		}
-
-		// Add the image to the CBZ file
 		cbzFile.Images = append(cbzFile.Images, Image{
-			Name:     filepath.Base(file.Name),
-			Data:     data,
-			MimeType: getMimeType(file.Name),
+			Name:     name,
+			Data:     content,
+			MimeType: mimeType,
 		})
-	}
-
-	// Sort images by name
-	sort.Slice(cbzFile.Images, func(i, j int) bool {
-		return cbzFile.Images[i].Name < cbzFile.Images[j].Name
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	return cbzFile, nil
 }
 
-// MergeFiles merges multiple CBZ files into one
+// MergeFiles merges multiple CBZ files into one, streaming images to avoid
+// loading all into memory at once.
 func MergeFiles(inputFiles []string, outputFile string) error {
 	// Create a new zip file
 	zipFile, err := os.Create(outputFile)
@@ -84,46 +108,42 @@ func MergeFiles(inputFiles []string, outputFile string) error {
 	zipWriter := zip.NewWriter(zipFile)
 	defer zipWriter.Close()
 
-	// Process each input file
+	// Stream each input file's images straight into the output archive so we
+	// never hold more than one image in memory at a time.
 	imageCounter := 1
 	for chapterIndex, inputFile := range inputFiles {
-		cbzFile, err := ReadFile(inputFile)
-		if err != nil {
-			return fmt.Errorf("failed to read input file %s: %w", inputFile, err)
-		}
-
-		// Add each image to the output zip with a new name to avoid conflicts
-		for _, image := range cbzFile.Images {
+		err := IterateImages(inputFile, func(name string, data io.Reader, mimeType string) error {
 			// Create a new name for the image: chapterXXX_imageYYY.ext
-			ext := filepath.Ext(image.Name)
+			ext := filepath.Ext(name)
 			newName := fmt.Sprintf("chapter%03d_%03d%s", chapterIndex+1, imageCounter, ext)
 			imageCounter++
 
-			// Create a new file in the zip
 			writer, err := zipWriter.Create(newName)
 			if err != nil {
 				return fmt.Errorf("failed to create file in output zip: %w", err)
 			}
 
-			// Write the image data
-			_, err = writer.Write(image.Data)
-			if err != nil {
+			if _, err := io.Copy(writer, data); err != nil {
 				return fmt.Errorf("failed to write image data: %w", err)
 			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("failed to read input file %s: %w", inputFile, err)
 		}
 	}
 
 	return nil
 }
 
-// isImageFile checks if a file is an image based on its extension
-func isImageFile(filename string) bool {
+// IsImageFile reports whether filename has a supported image extension.
+func IsImageFile(filename string) bool {
 	ext := strings.ToLower(filepath.Ext(filename))
 	return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" || ext == ".webp"
 }
 
-// getMimeType returns the MIME type for a file based on its extension
-func getMimeType(filename string) string {
+// MimeType returns the MIME type for filename based on its extension.
+func MimeType(filename string) string {
 	ext := strings.ToLower(filepath.Ext(filename))
 	switch ext {
 	case ".jpg", ".jpeg":

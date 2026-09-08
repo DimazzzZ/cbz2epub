@@ -2,12 +2,14 @@ package cbz
 
 import (
 	"archive/zip"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
-// TestIsImageFile tests the isImageFile function
+// TestIsImageFile tests the IsImageFile function
 func TestIsImageFile(t *testing.T) {
 	tests := []struct {
 		filename string
@@ -27,14 +29,14 @@ func TestIsImageFile(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		result := isImageFile(test.filename)
+		result := IsImageFile(test.filename)
 		if result != test.expected {
-			t.Errorf("isImageFile(%s) = %v, expected %v", test.filename, result, test.expected)
+			t.Errorf("IsImageFile(%s) = %v, expected %v", test.filename, result, test.expected)
 		}
 	}
 }
 
-// TestGetMimeType tests the getMimeType function
+// TestGetMimeType tests the MimeType function
 func TestGetMimeType(t *testing.T) {
 	tests := []struct {
 		filename string
@@ -54,9 +56,9 @@ func TestGetMimeType(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		result := getMimeType(test.filename)
+		result := MimeType(test.filename)
 		if result != test.expected {
-			t.Errorf("getMimeType(%s) = %v, expected %v", test.filename, result, test.expected)
+			t.Errorf("MimeType(%s) = %v, expected %v", test.filename, result, test.expected)
 		}
 	}
 }
@@ -209,5 +211,99 @@ func TestMergeFiles(t *testing.T) {
 		if len(fileName) < 8 || fileName[:7] != "chapter" {
 			t.Errorf("Unexpected file name format: %s", fileName)
 		}
+	}
+}
+
+// TestIterateImages verifies streaming iteration yields images in sorted order,
+// skips non-image entries, and forwards reader content and MIME types correctly.
+func TestIterateImages(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cbz_iterate_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	testCBZ := filepath.Join(tempDir, "test.cbz")
+	// Deliberately out of order to verify sorting.
+	testImages := []struct{ name, content string }{
+		{"image2.png", "content-2"},
+		{"image1.jpg", "content-1"},
+		{"subfolder/image3.gif", "content-3"},
+		{"not_an_image.txt", "nope"},
+	}
+	createTestCBZ(t, testCBZ, testImages)
+
+	type got struct {
+		name     string
+		content  string
+		mimeType string
+	}
+	var results []got
+	err = IterateImages(testCBZ, func(name string, data io.Reader, mimeType string) error {
+		b, err := io.ReadAll(data)
+		if err != nil {
+			return err
+		}
+		results = append(results, got{name: name, content: string(b), mimeType: mimeType})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("IterateImages failed: %v", err)
+	}
+
+	// Only the 3 image files, sorted by base name.
+	if len(results) != 3 {
+		t.Fatalf("Expected 3 images, got %d", len(results))
+	}
+	expected := []got{
+		{"image1.jpg", "content-1", "image/jpeg"},
+		{"image2.png", "content-2", "image/png"},
+		{"image3.gif", "content-3", "image/gif"},
+	}
+	for i, exp := range expected {
+		if results[i] != exp {
+			t.Errorf("image %d: got %+v, want %+v", i, results[i], exp)
+		}
+	}
+}
+
+// TestIterateImagesHandlerError verifies a handler error stops iteration and propagates.
+func TestIterateImagesHandlerError(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cbz_iterate_err_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	testCBZ := filepath.Join(tempDir, "test.cbz")
+	createTestCBZ(t, testCBZ, []struct{ name, content string }{
+		{"image1.jpg", "content-1"},
+		{"image2.png", "content-2"},
+	})
+
+	sentinel := errors.New("boom")
+	calls := 0
+	err = IterateImages(testCBZ, func(name string, data io.Reader, mimeType string) error {
+		calls++
+		return sentinel
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("expected sentinel error to propagate, got %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("expected iteration to stop after first error, got %d calls", calls)
+	}
+}
+
+// TestIterateImagesMissingFile verifies opening a nonexistent CBZ returns an error.
+func TestIterateImagesMissingFile(t *testing.T) {
+	err := IterateImages("/nonexistent/path/to.cbz", func(name string, data io.Reader, mimeType string) error {
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected error for missing file, got nil")
 	}
 }
