@@ -1,0 +1,236 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.2.0). Leave empty to derive from tag."
+        required: false
+        type: string
+      prerelease:
+        description: "Mark as prerelease"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_PRERELEASE: ${{ github.event.inputs.prerelease }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            version="${INPUT_VERSION}"
+          elif [ "${REF_TYPE}" = "tag" ]; then
+            version="${REF_NAME#v}"
+          else
+            echo "No version input and not a tag ref; cannot resolve version." >&2
+            exit 1
+          fi
+
+          # Validate semver (with optional pre-release/build suffix)
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'; then
+            echo "Invalid version: $version" >&2
+            exit 1
+          fi
+
+          # Auto-detect prerelease from suffix or manual input
+          prerelease=false
+          if printf '%s' "$version" | grep -Eq -- '-(alpha|beta|rc)'; then
+            prerelease=true
+          fi
+          if [ "${INPUT_PRERELEASE:-false}" = "true" ]; then
+            prerelease=true
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$version prerelease=$prerelease"
+
+      - name: Create or reuse draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          PRERELEASE: ${{ steps.resolve.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+
+          # Extract release notes from CHANGELOG.md for this version, fallback to generated notes.
+          notes_file="$(mktemp)"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { capture=1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > "$notes_file" || true
+
+          if [ ! -s "$notes_file" ]; then
+            echo "No CHANGELOG section for $VERSION; will use generated notes."
+          fi
+
+          prerelease_flag=""
+          if [ "$PRERELEASE" = "true" ]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; leaving as-is (draft assumed)."
+          elif [ -s "$notes_file" ]; then
+            gh release create "$tag" \
+              --draft \
+              --title "$tag" \
+              --notes-file "$notes_file" \
+              $prerelease_flag
+          else
+            gh release create "$tag" \
+              --draft \
+              --title "$tag" \
+              --generate-notes \
+              $prerelease_flag
+          fi
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Build and package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          EXT: ${{ matrix.ext }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          binname="cbz2epub${EXT:-}"
+          go build -trimpath -ldflags="-s -w -X main.version=v${VERSION}" -o "dist/${binname}" ./cmd/cbz2epub
+
+          base="cbz2epub-v${VERSION}-${GOOS}-${GOARCH}"
+          staging="dist/${base}"
+          mkdir -p "$staging"
+          cp "dist/${binname}" "$staging/"
+          cp README.md LICENSE "$staging/"
+
+          cd dist
+          if [ "${GOOS}" = "windows" ]; then
+            archive="${base}.zip"
+            zip -r "$archive" "$base" >/dev/null
+          else
+            archive="${base}.tar.gz"
+            tar -czf "$archive" "$base"
+          fi
+          sha256sum "$archive" > "${archive}.sha256"
+          echo "Built $archive"
+
+      - name: Upload assets to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          base="cbz2epub-v${VERSION}-${GOOS}-${GOARCH}"
+          cd dist
+          if [ "${GOOS}" = "windows" ]; then
+            archive="${base}.zip"
+          else
+            archive="${base}.tar.gz"
+          fi
+          gh release upload "$tag" "$archive" "${archive}.sha256" --clobber
+
+  publish:
+    name: Publish release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify assets and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+
+          expected=(
+            "cbz2epub-v${VERSION}-linux-amd64.tar.gz"
+            "cbz2epub-v${VERSION}-linux-arm64.tar.gz"
+            "cbz2epub-v${VERSION}-darwin-amd64.tar.gz"
+            "cbz2epub-v${VERSION}-darwin-arm64.tar.gz"
+            "cbz2epub-v${VERSION}-windows-amd64.zip"
+          )
+
+          assets="$(gh release view "$tag" --json assets --jq '.assets[].name')"
+          echo "Uploaded assets:"
+          echo "$assets"
+
+          missing=0
+          for a in "${expected[@]}"; do
+            if ! printf '%s\n' "$assets" | grep -qx "$a"; then
+              echo "Missing expected asset: $a" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "One or more expected assets missing; not publishing." >&2
+            exit 1
+          fi
+
+          # Publish (un-draft) the release.
+          gh release edit "$tag" --draft=false
+          echo "Published $tag"

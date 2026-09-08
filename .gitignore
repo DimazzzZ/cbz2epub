@@ -1,2 +1,15 @@
 .idea/*
 cbz2epub.iml
+
+# Build artifacts
+/cbz2epub
+/cbz2epub.exe
+/dist/
+
+# Test / coverage output
+coverage.out
+*.out
+cmd/cbz2epub/merged.cbz
+
+# OS files
+.DS_Store
