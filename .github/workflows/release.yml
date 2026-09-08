@@ -1,14 +1,11 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release (e.g. 0.2.0). Leave empty to derive from tag."
-        required: false
+        description: "Version to release (e.g. 0.2.0). Do not include the leading 'v'."
+        required: true
         type: string
       prerelease:
         description: "Mark as prerelease"
@@ -39,19 +36,15 @@ jobs:
         env:
           INPUT_VERSION: ${{ github.event.inputs.version }}
           INPUT_PRERELEASE: ${{ github.event.inputs.prerelease }}
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
 
-          if [ -n "${INPUT_VERSION:-}" ]; then
-            version="${INPUT_VERSION}"
-          elif [ "${REF_TYPE}" = "tag" ]; then
-            version="${REF_NAME#v}"
-          else
-            echo "No version input and not a tag ref; cannot resolve version." >&2
+          if [ -z "${INPUT_VERSION:-}" ]; then
+            echo "version input is required" >&2
             exit 1
           fi
+          # Accept both "0.2.0" and "v0.2.0" — normalise to no-leading-v.
+          version="${INPUT_VERSION#v}"
 
           # Validate semver (with optional pre-release/build suffix)
           if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'; then
@@ -77,6 +70,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.resolve.outputs.version }}
           PRERELEASE: ${{ steps.resolve.outputs.prerelease }}
+          TARGET_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           tag="v${VERSION}"
@@ -104,12 +98,14 @@ jobs:
             gh release create "$tag" \
               --draft \
               --title "$tag" \
+              --target "$TARGET_SHA" \
               --notes-file "$notes_file" \
               $prerelease_flag
           else
             gh release create "$tag" \
               --draft \
               --title "$tag" \
+              --target "$TARGET_SHA" \
               --generate-notes \
               $prerelease_flag
           fi
