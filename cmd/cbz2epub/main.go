@@ -1,4 +1,4 @@
-package cbz2epub
+package main
 
 import (
 	"flag"
@@ -13,6 +13,19 @@ import (
 	"cbz2epub/epub"
 )
 
+// version is the application version. It is overridden at build time via
+// -ldflags "-X main.version=<tag>" in the release workflow; it defaults to
+// "dev" for source builds.
+var version = "dev"
+
+// main is the entry point for the cbz2epub application.
+func main() {
+	if err := execute(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 // Config holds the application configuration
 type Config struct {
 	Merge      bool
@@ -21,19 +34,28 @@ type Config struct {
 	Verbose    bool
 	Recursive  bool
 	InputFiles []string
+	Version    bool
 }
 
-// Execute runs the application
-func Execute() error {
+// execute runs the application with the given command-line arguments.
+// It accepts args (typically os.Args[1:]) so the entry point is testable
+// without touching global flag state.
+func execute(args []string) error {
 	// Set up logging
 	log.SetPrefix("[CBZ2EPUB] ")
 	log.SetFlags(log.LstdFlags)
 
 	// Parse command line flags
-	config := parseFlags()
+	config, err := parseFlags(args)
+	if err != nil {
+		return err
+	}
 
 	// Process commands
-	if config.Merge {
+	if config.Version {
+		fmt.Fprintf(os.Stdout, "cbz2epub %s\n", version)
+		return nil
+	} else if config.Merge {
 		return handleMergeCommand(config)
 	} else if config.Convert {
 		return handleConvertCommand(config)
@@ -43,19 +65,25 @@ func Execute() error {
 	}
 }
 
-// parseFlags parses command line flags and returns a Config
-func parseFlags() Config {
-	// Define command line flags
-	mergeCmd := flag.Bool("merge", false, "Merge multiple CBZ files into one")
-	convertCmd := flag.Bool("convert", false, "Convert CBZ to EPUB")
-	outputFile := flag.String("output", "", "Output file name")
-	verbose := flag.Bool("verbose", false, "Enable verbose output")
-	recursive := flag.Bool("recursive", false, "Process directories recursively")
+// parseFlags parses command line flags from the given args and returns a Config.
+// It uses a local FlagSet (ContinueOnError) instead of the global flag.CommandLine
+// so it can be called repeatedly and tested without global-state gymnastics.
+func parseFlags(args []string) (Config, error) {
+	// Define command line flags on a local flag set.
+	fs := flag.NewFlagSet("cbz2epub", flag.ContinueOnError)
+	mergeCmd := fs.Bool("merge", false, "Merge multiple CBZ files into one")
+	convertCmd := fs.Bool("convert", false, "Convert CBZ to EPUB")
+	outputFile := fs.String("output", "", "Output file name")
+	verbose := fs.Bool("verbose", false, "Enable verbose output")
+	recursive := fs.Bool("recursive", false, "Process directories recursively")
+	showVersion := fs.Bool("version", false, "Print version and exit")
 
-	flag.Parse()
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
 
 	// Get input files
-	inputFiles := flag.Args()
+	inputFiles := fs.Args()
 
 	// If no input files specified, check if we should process current directory
 	if len(inputFiles) == 0 && *recursive {
@@ -73,7 +101,8 @@ func parseFlags() Config {
 		Verbose:    *verbose,
 		Recursive:  *recursive,
 		InputFiles: inputFiles,
-	}
+		Version:    *showVersion,
+	}, nil
 }
 
 // handleMergeCommand handles the merge command
@@ -116,38 +145,23 @@ func handleConvertCommand(config Config) error {
 		return fmt.Errorf("no input files specified")
 	}
 
+	// Collect all .cbz file paths from the inputs.
+	cbzFiles, err := walkCBZFiles(config.InputFiles, config.Recursive, config.Verbose)
+	if err != nil {
+		return err
+	}
+
+	// Convert each collected file.
 	var conversionError error
-
-	// Process each input file
-	for _, inputFile := range config.InputFiles {
-		// Check if it's a directory
-		fileInfo, err := os.Stat(inputFile)
-		if err != nil {
-			log.Printf("Error accessing %s: %v\n", inputFile, err)
-			conversionError = err
-			continue
-		}
-
-		if fileInfo.IsDir() {
-			if config.Recursive {
-				if err := processDirectory(inputFile, config); err != nil {
-					conversionError = err
-				}
-			} else {
-				log.Printf("Skipping directory %s (use -recursive to process directories)\n", inputFile)
-			}
-			continue
-		}
-
-		// Process single file
-		if !strings.HasSuffix(strings.ToLower(inputFile), ".cbz") {
-			log.Printf("Skipping non-CBZ file: %s\n", inputFile)
-			continue
-		}
-
-		// Set output file name
+	// The -output flag is only honored when the user passed exactly one input
+	// argument and it resolved to a single file (not a directory walk).
+	useExplicitOutput := config.OutputFile != "" &&
+		len(config.InputFiles) == 1 &&
+		len(cbzFiles) == 1 &&
+		cbzFiles[0] == config.InputFiles[0]
+	for _, inputFile := range cbzFiles {
 		outputFile := config.OutputFile
-		if outputFile == "" || len(config.InputFiles) > 1 {
+		if !useExplicitOutput {
 			outputFile = strings.TrimSuffix(inputFile, ".cbz") + ".epub"
 		}
 
@@ -155,9 +169,7 @@ func handleConvertCommand(config Config) error {
 			log.Printf("Converting %s to %s\n", inputFile, outputFile)
 		}
 
-		// Convert file
-		err = epub.ConvertFile(inputFile, outputFile)
-		if err != nil {
+		if err := epub.ConvertFile(inputFile, outputFile); err != nil {
 			log.Printf("Error converting %s: %v\n", inputFile, err)
 			conversionError = err
 			continue
@@ -169,62 +181,74 @@ func handleConvertCommand(config Config) error {
 	return conversionError
 }
 
-// processDirectory processes all CBZ files in a directory
-func processDirectory(dirPath string, config Config) error {
-	if config.Verbose {
-		log.Printf("Processing directory: %s\n", dirPath)
-	}
+// walkCBZFiles resolves a list of file/directory arguments into a flat list of
+// .cbz file paths.  When recursive is true, directories are walked; otherwise
+// they are skipped with a log message.
+func walkCBZFiles(inputs []string, recursive, verbose bool) ([]string, error) {
+	var cbzFiles []string
 
-	var processingError error
-
-	// Find all CBZ files in the directory
-	files, err := filepath.Glob(filepath.Join(dirPath, "*.cbz"))
-	if err != nil {
-		log.Printf("Error finding CBZ files in %s: %v\n", dirPath, err)
-		return err
-	}
-
-	if len(files) == 0 {
-		log.Printf("No CBZ files found in %s\n", dirPath)
-		return nil
-	}
-
-	// Process each file
-	for _, file := range files {
-		outputFile := strings.TrimSuffix(file, ".cbz") + ".epub"
-
-		if config.Verbose {
-			log.Printf("Converting %s to %s\n", file, outputFile)
+	for _, input := range inputs {
+		info, err := os.Stat(input)
+		if err != nil {
+			log.Printf("Error accessing %s: %v\n", input, err)
+			return nil, err
 		}
 
-		err := epub.ConvertFile(file, outputFile)
-		if err != nil {
-			log.Printf("Error converting %s: %v\n", file, err)
-			processingError = err
+		if !info.IsDir() {
+			if strings.HasSuffix(strings.ToLower(input), ".cbz") {
+				cbzFiles = append(cbzFiles, input)
+			} else {
+				log.Printf("Skipping non-CBZ file: %s\n", input)
+			}
 			continue
 		}
 
-		log.Printf("Successfully converted %s to %s\n", file, outputFile)
-	}
+		if !recursive {
+			log.Printf("Skipping directory %s (use -recursive to process directories)\n", input)
+			continue
+		}
 
-	// If recursive, process subdirectories
-	if config.Recursive {
-		subdirs, err := os.ReadDir(dirPath)
+		if verbose {
+			log.Printf("Processing directory: %s\n", input)
+		}
+
+		collected, err := collectCBZInDir(input, verbose)
 		if err != nil {
-			log.Printf("Error reading subdirectories in %s: %v\n", dirPath, err)
-			return err
+			return nil, err
 		}
+		cbzFiles = append(cbzFiles, collected...)
+	}
 
-		for _, subdir := range subdirs {
-			if subdir.IsDir() {
-				if err := processDirectory(filepath.Join(dirPath, subdir.Name()), config); err != nil && processingError == nil {
-					processingError = err
-				}
+	return cbzFiles, nil
+}
+
+// collectCBZInDir recursively collects .cbz file paths under dirPath.
+func collectCBZInDir(dirPath string, verbose bool) ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(dirPath, "*.cbz"))
+	if err != nil {
+		log.Printf("Error finding CBZ files in %s: %v\n", dirPath, err)
+		return nil, err
+	}
+
+	cbzFiles := append([]string{}, matches...)
+
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		log.Printf("Error reading subdirectories in %s: %v\n", dirPath, err)
+		return cbzFiles, err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			sub, err := collectCBZInDir(filepath.Join(dirPath, entry.Name()), verbose)
+			if err != nil {
+				return cbzFiles, err
 			}
+			cbzFiles = append(cbzFiles, sub...)
 		}
 	}
 
-	return processingError
+	return cbzFiles, nil
 }
 
 // printUsage prints the usage information

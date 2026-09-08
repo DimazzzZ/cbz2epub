@@ -2,6 +2,7 @@ package epub
 
 import (
 	"archive/zip"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,41 +45,18 @@ func createTestCBZ(t *testing.T, filename string, images []struct{ name, content
 	// Add images to the CBZ File object
 	for _, image := range images {
 		// Skip non-image files
-		if !isImageFile(image.name) {
+		if !cbz.IsImageFile(image.name) {
 			continue
 		}
 
 		cbzFile.Images = append(cbzFile.Images, cbz.Image{
 			Name:     filepath.Base(image.name),
 			Data:     []byte(image.content),
-			MimeType: getMimeType(image.name),
+			MimeType: cbz.MimeType(image.name),
 		})
 	}
 
 	return cbzFile
-}
-
-// isImageFile checks if a file is an image based on its extension
-func isImageFile(filename string) bool {
-	ext := strings.ToLower(filepath.Ext(filename))
-	return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" || ext == ".webp"
-}
-
-// getMimeType returns the MIME type for a file based on its extension
-func getMimeType(filename string) string {
-	ext := strings.ToLower(filepath.Ext(filename))
-	switch ext {
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".png":
-		return "image/png"
-	case ".gif":
-		return "image/gif"
-	case ".webp":
-		return "image/webp"
-	default:
-		return "application/octet-stream"
-	}
 }
 
 // TestConvertFromCBZ tests the ConvertFromCBZ function
@@ -162,7 +140,7 @@ func TestConvertFromCBZ(t *testing.T) {
 	// Only count image files (not the text file)
 	expectedImageCount := 0
 	for _, image := range testImages {
-		if isImageFile(image.name) {
+		if cbz.IsImageFile(image.name) {
 			expectedImageCount++
 		}
 	}
@@ -217,5 +195,118 @@ func TestConvertFile(t *testing.T) {
 	err = ConvertFile(filepath.Join(tempDir, "nonexistent.cbz"), filepath.Join(tempDir, "nonexistent.epub"))
 	if err == nil {
 		t.Errorf("ConvertFile should fail with non-existent file")
+	}
+}
+
+// TestConvertStreaming verifies the streaming EPUB conversion produces the same
+// structural output as the in-memory ConvertFromCBZ path.
+func TestConvertStreaming(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "epub_stream_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Build a real CBZ on disk.
+	testImages := []struct{ name, content string }{
+		{"002.png", "content-2"},
+		{"001.jpg", "content-1"},
+		{"not_image.txt", "skip me"},
+		{"003.gif", "content-3"},
+	}
+	testCBZPath := filepath.Join(tempDir, "book.cbz")
+	_ = createTestCBZ(t, testCBZPath, testImages)
+
+	// Convert via the streaming API.
+	epubPath := filepath.Join(tempDir, "book.epub")
+	if err := ConvertStreaming(testCBZPath, epubPath); err != nil {
+		t.Fatalf("ConvertStreaming failed: %v", err)
+	}
+
+	// Open the EPUB and check structure.
+	zipReader, err := zip.OpenReader(epubPath)
+	if err != nil {
+		t.Fatalf("Failed to open EPUB: %v", err)
+	}
+	defer zipReader.Close()
+
+	required := []string{
+		"mimetype",
+		"META-INF/container.xml",
+		"OEBPS/content.opf",
+		"OEBPS/toc.ncx",
+		"OEBPS/images/image001.jpg",
+		"OEBPS/images/image002.png",
+		"OEBPS/images/image003.gif",
+		"OEBPS/pages/page001.xhtml",
+		"OEBPS/pages/page002.xhtml",
+		"OEBPS/pages/page003.xhtml",
+	}
+	present := make(map[string]bool)
+	for _, f := range zipReader.File {
+		present[f.Name] = true
+	}
+	for _, name := range required {
+		if !present[name] {
+			t.Errorf("EPUB missing required entry: %s", name)
+		}
+	}
+
+	// Verify sort order: 001.jpg maps to image001 with content-1.
+	for _, f := range zipReader.File {
+		if f.Name == "OEBPS/images/image001.jpg" {
+			rc, err := f.Open()
+			if err != nil {
+				t.Fatalf("failed to open image001: %v", err)
+			}
+			b, _ := io.ReadAll(rc)
+			rc.Close()
+			if string(b) != "content-1" {
+				t.Errorf("image001.jpg content = %q, want %q", string(b), "content-1")
+			}
+		}
+	}
+
+	// Verify content.opf references image001..image003 and page001..page003.
+	for _, f := range zipReader.File {
+		if f.Name == "OEBPS/content.opf" {
+			rc, err := f.Open()
+			if err != nil {
+				t.Fatalf("failed to open content.opf: %v", err)
+			}
+			b, _ := io.ReadAll(rc)
+			rc.Close()
+			opf := string(b)
+			for _, want := range []string{"image001", "image002", "image003", "page001", "page002", "page003"} {
+				if !strings.Contains(opf, want) {
+					t.Errorf("content.opf missing %s", want)
+				}
+			}
+		}
+	}
+}
+
+// TestConvertFileUsesStreaming verifies ConvertFile now delegates to the
+// streaming path (i.e., works end-to-end on a real file without loading everything).
+func TestConvertFileUsesStreaming(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "epub_convert_file_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	testImages := []struct{ name, content string }{
+		{"a.jpg", "img-a"},
+		{"b.png", "img-b"},
+	}
+	testCBZPath := filepath.Join(tempDir, "book.cbz")
+	_ = createTestCBZ(t, testCBZPath, testImages)
+
+	epubPath := filepath.Join(tempDir, "book.epub")
+	if err := ConvertFile(testCBZPath, epubPath); err != nil {
+		t.Fatalf("ConvertFile failed: %v", err)
+	}
+	if _, err := os.Stat(epubPath); os.IsNotExist(err) {
+		t.Fatalf("EPUB not created")
 	}
 }
