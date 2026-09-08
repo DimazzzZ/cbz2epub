@@ -1,5 +1,10 @@
 # CBZ2EPUB
 
+[![CI](https://github.com/DimazzzZ/cbz2epub/actions/workflows/ci.yml/badge.svg)](https://github.com/DimazzzZ/cbz2epub/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/badge/Go-1.24+-blue)](https://golang.org/dl/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![Releases](https://img.shields.io/github/v/release/DimazzzZ/cbz2epub)](https://github.com/DimazzzZ/cbz2epub/releases)
+
 CBZ2EPUB is a command-line tool for working with comic book archives. It allows you to merge multiple CBZ (Comic Book ZIP) files into a single file and convert CBZ files to EPUB format for e-readers.
 
 ## Features
@@ -19,7 +24,7 @@ Pre-built binaries for various platforms are available on the [Releases](https:/
 
 #### Prerequisites
 
-- Go 1.18 or later
+- Go 1.24 or later
 
 #### Build Instructions
 
@@ -33,7 +38,7 @@ Pre-built binaries for various platforms are available on the [Releases](https:/
 
 2. Build the application:
    ```bash
-   go build -o cbz2epub
+   go build -o cbz2epub ./cmd/cbz2epub
    ```
 
 3. (Optional) Install the application to your PATH:
@@ -51,7 +56,7 @@ Pre-built binaries for various platforms are available on the [Releases](https:/
 
 2. Build the application:
    ```cmd
-   go build -o cbz2epub.exe
+   go build -o cbz2epub.exe ./cmd/cbz2epub
    ```
 
 3. (Optional) Add the directory to your PATH or move the executable to a directory in your PATH.

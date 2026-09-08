@@ -1,24 +1,15 @@
-package cbz2epub
+package main
 
 import (
 	"archive/zip"
-	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 // TestParseFlags tests the parseFlags function
 func TestParseFlags(t *testing.T) {
-	// Save original command line arguments and flags
-	oldArgs := os.Args
-	oldFlagCommandLine := flag.CommandLine
-	defer func() {
-		// Restore original command line arguments and flags
-		os.Args = oldArgs
-		flag.CommandLine = oldFlagCommandLine
-	}()
-
 	// Test cases
 	testCases := []struct {
 		name           string
@@ -27,7 +18,7 @@ func TestParseFlags(t *testing.T) {
 	}{
 		{
 			name: "merge command",
-			args: []string{"cbz2epub", "-merge", "file1.cbz", "file2.cbz"},
+			args: []string{"-merge", "file1.cbz", "file2.cbz"},
 			expectedConfig: Config{
 				Merge:      true,
 				Convert:    false,
@@ -39,7 +30,7 @@ func TestParseFlags(t *testing.T) {
 		},
 		{
 			name: "merge command with output",
-			args: []string{"cbz2epub", "-merge", "-output", "merged.cbz", "file1.cbz", "file2.cbz"},
+			args: []string{"-merge", "-output", "merged.cbz", "file1.cbz", "file2.cbz"},
 			expectedConfig: Config{
 				Merge:      true,
 				Convert:    false,
@@ -51,7 +42,7 @@ func TestParseFlags(t *testing.T) {
 		},
 		{
 			name: "convert command",
-			args: []string{"cbz2epub", "-convert", "file.cbz"},
+			args: []string{"-convert", "file.cbz"},
 			expectedConfig: Config{
 				Merge:      false,
 				Convert:    true,
@@ -63,7 +54,7 @@ func TestParseFlags(t *testing.T) {
 		},
 		{
 			name: "convert command with output",
-			args: []string{"cbz2epub", "-convert", "-output", "file.epub", "file.cbz"},
+			args: []string{"-convert", "-output", "file.epub", "file.cbz"},
 			expectedConfig: Config{
 				Merge:      false,
 				Convert:    true,
@@ -75,7 +66,7 @@ func TestParseFlags(t *testing.T) {
 		},
 		{
 			name: "convert command with verbose",
-			args: []string{"cbz2epub", "-convert", "-verbose", "file.cbz"},
+			args: []string{"-convert", "-verbose", "file.cbz"},
 			expectedConfig: Config{
 				Merge:      false,
 				Convert:    true,
@@ -87,7 +78,7 @@ func TestParseFlags(t *testing.T) {
 		},
 		{
 			name: "convert command with recursive",
-			args: []string{"cbz2epub", "-convert", "-recursive", "directory"},
+			args: []string{"-convert", "-recursive", "directory"},
 			expectedConfig: Config{
 				Merge:      false,
 				Convert:    true,
@@ -99,7 +90,7 @@ func TestParseFlags(t *testing.T) {
 		},
 		{
 			name: "no command",
-			args: []string{"cbz2epub"},
+			args: []string{},
 			expectedConfig: Config{
 				Merge:      false,
 				Convert:    false,
@@ -113,13 +104,11 @@ func TestParseFlags(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Reset flags
-			flag.CommandLine = flag.NewFlagSet(tc.args[0], flag.ExitOnError)
-			// Set command line arguments
-			os.Args = tc.args
-
-			// Call parseFlags
-			config := parseFlags()
+			// Call parseFlags with the args directly; no global state involved.
+			config, err := parseFlags(tc.args)
+			if err != nil {
+				t.Fatalf("parseFlags returned unexpected error: %v", err)
+			}
 
 			// Check results
 			if config.Merge != tc.expectedConfig.Merge {
@@ -388,11 +377,208 @@ func TestHandleConvertCommand(t *testing.T) {
 }
 
 // TestExecute is a placeholder test for the Execute function
-// Testing the actual Execute function is complex due to global flag state
-// and would require significant mocking. Instead, we test the individual
-// components (parseFlags, handleMergeCommand, handleConvertCommand) separately.
+// TestWalkCBZFiles tests the walkCBZFiles function
+func TestWalkCBZFiles(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "walk_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create a nested directory structure:
+	//   tempDir/
+	//     a.cbz
+	//     b.txt
+	//     sub/
+	//       c.cbz
+	//       deep/
+	//         d.cbz
+	for _, name := range []string{"a.cbz", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(tempDir, name), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	subDir := filepath.Join(tempDir, "sub")
+	deepDir := filepath.Join(subDir, "deep")
+	if err := os.MkdirAll(deepDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{filepath.Join(subDir, "c.cbz"), filepath.Join(deepDir, "d.cbz")} {
+		if err := os.WriteFile(name, []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		name      string
+		inputs    []string
+		recursive bool
+		wantCount int
+		wantErr   bool
+	}{
+		{
+			name:      "single cbz file",
+			inputs:    []string{filepath.Join(tempDir, "a.cbz")},
+			recursive: false,
+			wantCount: 1,
+		},
+		{
+			name:      "non-cbz file is skipped",
+			inputs:    []string{filepath.Join(tempDir, "b.txt")},
+			recursive: false,
+			wantCount: 0,
+		},
+		{
+			name:      "directory without recursive is skipped",
+			inputs:    []string{subDir},
+			recursive: false,
+			wantCount: 0,
+		},
+		{
+			name:      "directory with recursive collects nested files",
+			inputs:    []string{tempDir},
+			recursive: true,
+			wantCount: 3, // a.cbz, sub/c.cbz, sub/deep/d.cbz
+		},
+		{
+			name:      "mixed files and dirs",
+			inputs:    []string{filepath.Join(tempDir, "a.cbz"), subDir},
+			recursive: true,
+			wantCount: 3, // a.cbz, sub/c.cbz, sub/deep/d.cbz
+		},
+		{
+			name:      "nonexistent path returns error",
+			inputs:    []string{filepath.Join(tempDir, "nope.cbz")},
+			recursive: false,
+			wantErr:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := walkCBZFiles(tc.inputs, tc.recursive, false)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(got) != tc.wantCount {
+				t.Errorf("got %d files %v, want %d", len(got), got, tc.wantCount)
+			}
+		})
+	}
+}
+
+// writeTestCBZ creates a minimal valid CBZ (zip with one image) at path.
+func writeTestCBZ(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create cbz: %v", err)
+	}
+	defer f.Close()
+	zw := zip.NewWriter(f)
+	w, err := zw.Create("image.jpg")
+	if err != nil {
+		t.Fatalf("create zip entry: %v", err)
+	}
+	if _, err := w.Write([]byte("fake image data")); err != nil {
+		t.Fatalf("write zip entry: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+}
+
+// TestExecute drives the real entry point end-to-end by passing args directly,
+// exercising flag parsing + command dispatch without any global flag state.
 func TestExecute(t *testing.T) {
-	// This is a placeholder test to ensure coverage
-	// The actual functionality is tested in other tests
-	t.Skip("Skipping TestExecute as it requires complex mocking")
+	tempDir := t.TempDir()
+
+	cbzA := filepath.Join(tempDir, "a.cbz")
+	cbzB := filepath.Join(tempDir, "b.cbz")
+	writeTestCBZ(t, cbzA)
+	writeTestCBZ(t, cbzB)
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantErr    bool
+		wantOutput string // if non-empty, assert this file exists after run
+	}{
+		{
+			name:    "no command prints usage and succeeds",
+			args:    []string{},
+			wantErr: false,
+		},
+		{
+			name:       "convert single file with explicit output",
+			args:       []string{"-convert", "-output", filepath.Join(tempDir, "out.epub"), cbzA},
+			wantErr:    false,
+			wantOutput: filepath.Join(tempDir, "out.epub"),
+		},
+		{
+			name:       "merge two files with explicit output",
+			args:       []string{"-merge", "-output", filepath.Join(tempDir, "merged.cbz"), cbzA, cbzB},
+			wantErr:    false,
+			wantOutput: filepath.Join(tempDir, "merged.cbz"),
+		},
+		{
+			name:    "convert with no input files errors",
+			args:    []string{"-convert"},
+			wantErr: true,
+		},
+		{
+			name:    "merge with no input files errors",
+			args:    []string{"-merge"},
+			wantErr: true,
+		},
+		{
+			name:    "convert nonexistent file errors",
+			args:    []string{"-convert", filepath.Join(tempDir, "nope.cbz")},
+			wantErr: true,
+		},
+		{
+			name:    "unknown flag errors",
+			args:    []string{"-bogus"},
+			wantErr: true,
+		},
+		{
+			name:    "version flag prints version and succeeds",
+			args:    []string{"-version"},
+			wantErr: false,
+		},
+		{
+			name:       "convert single file with default output name",
+			args:       []string{"-convert", cbzA},
+			wantErr:    false,
+			wantOutput: strings.TrimSuffix(cbzA, ".cbz") + ".epub",
+		},
+		{
+			name:    "convert recursive on directory with cbz files",
+			args:    []string{"-convert", "-recursive", tempDir},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := execute(tc.args)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.wantOutput != "" {
+				if _, statErr := os.Stat(tc.wantOutput); statErr != nil {
+					t.Errorf("expected output %s to exist: %v", tc.wantOutput, statErr)
+				}
+			}
+		})
+	}
 }
